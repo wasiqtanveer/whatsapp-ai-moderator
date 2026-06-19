@@ -2,7 +2,17 @@
 
 <img src="assets/banner.png" alt="WhatsApp AI Moderator" width="100%" />
 
-# 🤖 WhatsApp AI Moderator
+```
+ ██╗    ██╗ █████╗     █████╗ ██╗    ███╗   ███╗ ██████╗ ██████╗
+ ██║    ██║██╔══██╗   ██╔══██╗██║    ████╗ ████║██╔═══██╗██╔══██╗
+ ██║ █╗ ██║███████║   ███████║██║    ██╔████╔██║██║   ██║██║  ██║
+ ██║███╗██║██╔══██║   ██╔══██║██║    ██║╚██╔╝██║██║   ██║██║  ██║
+ ╚███╔███╔╝██║  ██║   ██║  ██║██║    ██║ ╚═╝ ██║╚██████╔╝██████╔╝
+  ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝  ╚═╝╚═╝    ╚═╝     ╚═╝ ╚═════╝ ╚═════╝
+        W H A T S A P P   ·   A I   ·   M O D E R A T O R
+```
+
+<h1>🤖 WhatsApp AI Moderator</h1>
 
 ### A savage, AI-powered moderation bot that runs your WhatsApp group so you don't have to.
 
@@ -15,7 +25,18 @@ It watches every message, enforces your rules, roasts the rule-breakers with AI,
   <img alt="WhatsApp" src="https://img.shields.io/badge/whatsapp--web.js-25D366?style=for-the-badge&logo=whatsapp&logoColor=white" />
 </p>
 
+<p>
+  <img alt="Status" src="https://img.shields.io/badge/status-shipped-success?style=flat-square" />
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" />
+  <img alt="PRs" src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square" />
+  <img alt="Made with" src="https://img.shields.io/badge/made%20at-3AM%20during%20exams-orange?style=flat-square" />
+</p>
+
 </div>
+
+<br/>
+
+> ⚡ **TL;DR** — Drop a link, spam ALL CAPS, or flood media in the group? The bot deletes it, strikes you, and roasts you by name with AI. Tag the bot and it talks back: a loyal yes-man to the boss, savage to everyone else.
 
 ---
 
