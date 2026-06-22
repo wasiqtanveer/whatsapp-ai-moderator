@@ -86,13 +86,88 @@ async function resolveTarget(chat, message, name) {
     return null;
 }
 
+// Pending kick confirmations: requesterId -> { targetId, expiry }
+const pendingKicks = {};
+
+// Destructive actions only the boss may run.
+const BOSS_ONLY = new Set(['kick', 'warn', 'forgive', 'mute']);
+
 // Execute a parsed command. Returns true if it performed an action.
-async function executeCommand(cmd, chat, message) {
+// `role` is the requester's role ('boss' | 'coadmin').
+async function executeCommand(cmd, chat, message, role) {
     if (!cmd || !cmd.action) return false;
 
     const tag = (id) => '@' + String(id).split('@')[0];
 
+    // Gate destructive actions to the boss only.
+    if (BOSS_ONLY.has(cmd.action) && role !== 'boss') {
+        await chat.sendMessage('⚠️ Only the big boss can issue that command. 👑');
+        log.warn('COMMAND', `${cmd.action} blocked — requester role=${role} (boss-only).`);
+        return true;
+    }
+
     switch (cmd.action) {
+        case 'kick': {
+            const target = await resolveTarget(chat, message, cmd.target);
+            if (!target) {
+                await chat.sendMessage(`⚠️ Boss, I couldn't find "${cmd.target}" to remove.`);
+                log.warn('COMMAND', `kick: target "${cmd.target}" not found.`);
+                return true;
+            }
+            // Never allow kicking an admin/boss/coadmin.
+            const tNum = String(target).split('@')[0];
+            if (config.roleOf([tNum]) !== 'member') {
+                await chat.sendMessage(`⚠️ Boss, ${tag(target)} is an admin — I won't remove them.`);
+                log.warn('COMMAND', `kick refused — ${tNum} is an admin.`);
+                return true;
+            }
+            // Require confirmation before the destructive action.
+            const requester = message.author;
+            pendingKicks[requester] = { targetId: target, expiry: Date.now() + 60000 };
+            await chat.sendMessage(
+                `⚠️ Confirm: remove ${tag(target)} from the group? Reply "yes" within 60 seconds to confirm.`,
+                { mentions: [target] }
+            );
+            log.event('COMMAND', `kick pending confirmation → ${cmd.target}`);
+            return true;
+        }
+        case 'warn': {
+            const target = await resolveTarget(chat, message, cmd.target);
+            if (!target) {
+                await chat.sendMessage(`⚠️ Boss, I couldn't find "${cmd.target}" to warn.`);
+                return true;
+            }
+            const strikes = strikesTracker.addStrike(target);
+            const reason = cmd.reason || 'admin warning';
+            await chat.sendMessage(
+                `${tag(target)} ⚠️ Warning from the boss: ${reason}. Strike ${strikes}/${config.MAX_STRIKES}.`,
+                { mentions: [target] }
+            );
+            log.ok('COMMAND', `warn → ${cmd.target} (strike ${strikes}/${config.MAX_STRIKES}).`);
+            return true;
+        }
+        case 'forgive': {
+            const target = await resolveTarget(chat, message, cmd.target);
+            if (!target) {
+                await chat.sendMessage(`⚠️ Boss, I couldn't find "${cmd.target}" to forgive.`);
+                return true;
+            }
+            strikesTracker.resetStrikes(target);
+            await chat.sendMessage(`${tag(target)} ✅ The boss has cleared your strikes. Behave. 😇`, { mentions: [target] });
+            log.ok('COMMAND', `forgive → ${cmd.target} (strikes reset).`);
+            return true;
+        }
+        case 'mute': {
+            const target = await resolveTarget(chat, message, cmd.target);
+            if (!target) {
+                await chat.sendMessage(`⚠️ Boss, I couldn't find "${cmd.target}".`);
+                return true;
+            }
+            passesTracker.consumePass(target); // revoke any active pass
+            await chat.sendMessage(`${tag(target)} 🔒 Your rule-free pass has been revoked.`, { mentions: [target] });
+            log.ok('COMMAND', `mute → ${cmd.target} (pass revoked).`);
+            return true;
+        }
         case 'mention': {
             const target = await resolveTarget(chat, message, cmd.target);
             if (!target) {
@@ -185,6 +260,63 @@ client.on('message', async (message) => {
     const isAdmin = role === 'boss' || role === 'coadmin' ||
         (participant && (participant.isAdmin || participant.isSuperAdmin));
 
+    // ── CORE: Admin "allow" command takes priority over everything else.
+    // An admin sends a message containing ALLOW_COMMAND and @mentions the user(s)
+    // to grant each a pass. Checked FIRST so the AI talk-back can never hijack it.
+    if (isAdmin && message.body.toLowerCase().includes(config.ALLOW_COMMAND.toLowerCase())) {
+        // Only treat as the allow command when at least one NON-bot user is mentioned.
+        const grantTargets = (message.mentionedIds || [])
+            .filter(id => !botNums.has(String(id).split('@')[0]));
+        if (grantTargets.length > 0) {
+            const names = [];
+            for (const grantedTo of grantTargets) {
+                passesTracker.grantPass(grantedTo);
+                const num = grantedTo.split('@')[0];
+                names.push(num);
+                log.ok('OVERRIDE', `Operator granted bypass → ${num} (${config.PASS_ALLOWED_MESSAGES} msgs / ${config.PASS_DURATION_MS / 1000}s)`);
+            }
+            const mins = Math.round(config.PASS_DURATION_MS / 60000);
+            await chat.sendMessage(
+                `✅ ${names.map(n => '@' + n).join(' ')} you may send up to ${config.PASS_ALLOWED_MESSAGES} messages free of rules within the next ${mins} minutes.`,
+                { mentions: grantTargets }
+            );
+            return;
+        }
+        // "allow" with no user mentioned → fall through (could just be chatting).
+    }
+
+    // ── CORE: Pending kick confirmation. If the boss has a pending kick and
+    // says yes/confirm/do it, execute the removal. Checked before talk-back.
+    if (role === 'boss' && pendingKicks[authorId]) {
+        const pk = pendingKicks[authorId];
+        const body = (message.body || '').trim().toLowerCase();
+        const yes = /^(yes|y|yep|yeah|confirm|do it|go ahead|kick him|kick her|kick them)\b/.test(body);
+        const no = /^(no|n|cancel|stop|nvm|never ?mind|leave (him|her|them))\b/.test(body);
+
+        if (Date.now() > pk.expiry) {
+            delete pendingKicks[authorId];
+            // expired → fall through and treat message normally
+        } else if (yes) {
+            delete pendingKicks[authorId];
+            try {
+                await chat.removeParticipants([pk.targetId]);
+                strikesTracker.resetStrikes(pk.targetId);
+                await chat.sendMessage(`✅ ${'@' + String(pk.targetId).split('@')[0]} has been removed. As you command, boss. 👑`, { mentions: [pk.targetId] });
+                log.ok('COMMAND', `kick confirmed & executed → ${pk.targetId}`);
+            } catch (err) {
+                await chat.sendMessage('❌ I could not remove them. Make sure I am a group admin.');
+                log.error('COMMAND', `kick failed: ${err.message}`);
+            }
+            return;
+        } else if (no) {
+            delete pendingKicks[authorId];
+            await chat.sendMessage('👍 Cancelled. No one was removed.');
+            log.info('COMMAND', 'kick cancelled by boss.');
+            return;
+        }
+        // anything else → let it fall through to normal handling
+    }
+
     // ── Talk-back: anyone who @mentions the bot, replies to it, or says the
     // trigger keyword gets a reply, with tone based on their role. Runs BEFORE
     // moderation, and skips moderation.
@@ -224,7 +356,7 @@ client.on('message', async (message) => {
         if (role === 'boss' || role === 'coadmin') {
             log.event('TALKBACK', `${displayName} [${role}] gave the bot an instruction (${trigger}). Interpreting...`);
             const cmd = await ai.interpretCommand(message.body);
-            const handled = await executeCommand(cmd, chat, message);
+            const handled = await executeCommand(cmd, chat, message, role);
             if (!handled) {
                 // Not an actionable command → fall back to a friendly yes-man reply.
                 const reply = (cmd && cmd.text) || await ai.generateReply(message.body, {
@@ -238,44 +370,28 @@ client.on('message', async (message) => {
             return;
         }
 
-        // Members get a savage reply and the big-boss tag. No command power.
+        // Members: CORE rules come first. If their message to the bot breaks a
+        // rule, moderate it — do NOT reward rule-breaking with a chat reply.
+        const brokenRule = rules.find(r => r.check(message.body, message));
+        if (brokenRule) {
+            log.warn('TALKBACK', `${displayName} broke "${brokenRule.name}" while addressing the bot — moderating instead of replying.`);
+            await enforceViolation(brokenRule, message, chat, authorId, displayName, shortId);
+            return;
+        }
+
+        // Clean message → savage reply with a correct big-boss tag.
         log.event('TALKBACK', `${displayName} [member] addressed the bot (${trigger}). Generating clapback...`);
         const reply = await ai.generateReply(message.body, {
-            role, name: displayName, coadminTitle: config.COADMIN_TITLE
+            role, name: displayName, coadminTitle: config.COADMIN_TITLE, bossName: config.BOSS_NAME
         });
         if (reply) {
-            const bossNum = config.BOSS_IDS[0];
-            const bossTag = bossNum ? ` (@${bossNum} is the big boss 👑)` : '';
-            const mentions = bossNum ? [authorId, `${bossNum}@c.us`] : [authorId];
+            const bossPhone = config.BOSS_PHONE;
+            const bossTag = bossPhone ? ` (@${bossPhone} is the big boss 👑)` : '';
+            const mentions = bossPhone ? [authorId, `${bossPhone}@c.us`] : [authorId];
             await chat.sendMessage(`@${shortId} ${reply}${bossTag}`, { mentions });
             log.ok('TALKBACK', 'Clapback dispatched (member tone).');
         } else {
             log.warn('TALKBACK', 'No AI output — skipping reply.');
-        }
-        return; // talking to the bot = reply only, no moderation
-    }
-
-    // Admin "allow" command: an admin sends a message containing the ALLOW_COMMAND
-    // keyword and @mentions one or more users to grant each a one-time pass.
-    // Example:  allow @923001234567
-    if (isAdmin && message.body.toLowerCase().includes(config.ALLOW_COMMAND.toLowerCase())) {
-        const mentioned = message.mentionedIds || [];
-        if (mentioned.length > 0) {
-            const names = [];
-            for (const grantedTo of mentioned) {
-                passesTracker.grantPass(grantedTo);
-                const num = grantedTo.split('@')[0];
-                names.push(num);
-                log.ok('OVERRIDE', `Operator granted one-time bypass → ${num} (TTL ${config.PASS_DURATION_MS / 1000}s)`);
-            }
-            const mins = Math.round(config.PASS_DURATION_MS / 60000);
-            await chat.sendMessage(
-                `✅ ${names.map(n => '@' + n).join(' ')} you may send up to ${config.PASS_ALLOWED_MESSAGES} messages free of rules within the next ${mins} minutes.`,
-                { mentions: mentioned }
-            );
-        } else {
-            await chat.sendMessage('⚠️ Mention a user in your "allow" message, e.g. "allow @user".');
-            log.warn('OVERRIDE', 'Allow command used without any @mention — ignored.');
         }
         return;
     }
@@ -294,64 +410,65 @@ client.on('message', async (message) => {
     }
 
     // Run the ruleset.
-    for (const rule of rules) {
-        if (rule.check(message.body, message)) {
-            log.warn('VIOLATION', `${log.C.bold}${displayName}${log.C.reset} (${shortId}) tripped rule "${log.C.yellow}${rule.name}${log.C.reset}"`);
-
-            try {
-                await message.delete(true);
-                log.ok('ENFORCE', `Offending message purged for all participants.`);
-
-                const currentStrikes = strikesTracker.addStrike(authorId);
-                const userNumber = authorId.split('@')[0];
-                log.info('STRIKE', `${displayName} (${shortId}) → strike ${log.C.bold}${currentStrikes}/${config.MAX_STRIKES}${log.C.reset}`);
-
-                if (currentStrikes < config.MAX_STRIKES) {
-                    log.info('LLM', 'Requesting savage roast from Groq inference endpoint...');
-                    const roast = await ai.generateRoast(rule.reason, {
-                        kicked: false,
-                        strike: currentStrikes,
-                        maxStrikes: config.MAX_STRIKES,
-                        name: displayName
-                    });
-
-                    let warnMsg;
-                    if (roast) {
-                        log.ok('LLM', `Roast generated (${roast.length} chars).`);
-                        warnMsg = `@${userNumber} ${roast} (strike ${currentStrikes}/${config.MAX_STRIKES})`;
-                    } else {
-                        log.warn('LLM', 'No AI output — falling back to template warning.');
-                        warnMsg = config.WARN_MESSAGE
-                            .replace('{user}', userNumber)
-                            .replace('{reason}', rule.reason)
-                            .replace('{currentStrike}', currentStrikes)
-                            .replace('{maxStrikes}', config.MAX_STRIKES);
-                    }
-
-                    await chat.sendMessage(warnMsg, { mentions: [authorId] });
-                    log.ok('ENFORCE', `Warning dispatched to group.`);
-                } else {
-                    log.warn('ENFORCE', `Strike threshold reached — initiating removal of ${displayName} (${shortId}).`);
-                    log.info('LLM', 'Requesting farewell roast from Groq inference endpoint...');
-                    const roast = await ai.generateRoast(rule.reason, { kicked: true, name: displayName });
-
-                    let kickMsg = roast
-                        ? `@${userNumber} ${roast}`
-                        : config.KICK_MESSAGE.replace('{user}', userNumber);
-
-                    await chat.sendMessage(kickMsg, { mentions: [authorId] });
-                    await chat.removeParticipants([authorId]);
-                    strikesTracker.resetStrikes(authorId);
-                    log.ok('ENFORCE', `${log.C.bold}${displayName} (${shortId}) removed from group. Strike counter reset.${log.C.reset}`);
-                }
-            } catch (err) {
-                log.error('ENFORCE', `Action failed for ${shortId}: ${err.message}`);
-            }
-
-            break; // one violation per message
-        }
+    const tripped = rules.find(r => r.check(message.body, message));
+    if (tripped) {
+        await enforceViolation(tripped, message, chat, authorId, displayName, shortId);
     }
 });
+
+// Enforce a single rule violation: delete, strike, warn-with-roast, or kick.
+async function enforceViolation(rule, message, chat, authorId, displayName, shortId) {
+    log.warn('VIOLATION', `${log.C.bold}${displayName}${log.C.reset} (${shortId}) tripped rule "${log.C.yellow}${rule.name}${log.C.reset}"`);
+    try {
+        await message.delete(true);
+        log.ok('ENFORCE', `Offending message purged for all participants.`);
+
+        const currentStrikes = strikesTracker.addStrike(authorId);
+        const userNumber = authorId.split('@')[0];
+        log.info('STRIKE', `${displayName} (${shortId}) → strike ${log.C.bold}${currentStrikes}/${config.MAX_STRIKES}${log.C.reset}`);
+
+        if (currentStrikes < config.MAX_STRIKES) {
+            log.info('LLM', 'Requesting savage roast from Groq inference endpoint...');
+            const roast = await ai.generateRoast(rule.reason, {
+                kicked: false,
+                strike: currentStrikes,
+                maxStrikes: config.MAX_STRIKES,
+                name: displayName
+            });
+
+            let warnMsg;
+            if (roast) {
+                log.ok('LLM', `Roast generated (${roast.length} chars).`);
+                warnMsg = `@${userNumber} ${roast} (strike ${currentStrikes}/${config.MAX_STRIKES})`;
+            } else {
+                log.warn('LLM', 'No AI output — falling back to template warning.');
+                warnMsg = config.WARN_MESSAGE
+                    .replace('{user}', userNumber)
+                    .replace('{reason}', rule.reason)
+                    .replace('{currentStrike}', currentStrikes)
+                    .replace('{maxStrikes}', config.MAX_STRIKES);
+            }
+
+            await chat.sendMessage(warnMsg, { mentions: [authorId] });
+            log.ok('ENFORCE', `Warning dispatched to group.`);
+        } else {
+            log.warn('ENFORCE', `Strike threshold reached — initiating removal of ${displayName} (${shortId}).`);
+            log.info('LLM', 'Requesting farewell roast from Groq inference endpoint...');
+            const roast = await ai.generateRoast(rule.reason, { kicked: true, name: displayName });
+
+            let kickMsg = roast
+                ? `@${userNumber} ${roast}`
+                : config.KICK_MESSAGE.replace('{user}', userNumber);
+
+            await chat.sendMessage(kickMsg, { mentions: [authorId] });
+            await chat.removeParticipants([authorId]);
+            strikesTracker.resetStrikes(authorId);
+            log.ok('ENFORCE', `${log.C.bold}${displayName} (${shortId}) removed from group. Strike counter reset.${log.C.reset}`);
+        }
+    } catch (err) {
+        log.error('ENFORCE', `Action failed for ${shortId}: ${err.message}`);
+    }
+}
 
 // ── Start ──────────────────────────────────────────────────────
 log.info('CORE', 'Initializing WhatsApp Web client (Puppeteer/Chromium)...');

@@ -52,7 +52,7 @@ async function generateRoast(reason, opts = {}) {
 }
 
 // Persona instructions per role.
-function personaFor(role, name, coadminTitle) {
+function personaFor(role, name, coadminTitle, bossName) {
     const common =
         'You are a witty WhatsApp group AI bot. Reply in ONE short, natural line ' +
         '(max 35 words). NEVER use slurs, profanity, or hate speech. Do NOT ' +
@@ -72,12 +72,15 @@ function personaFor(role, name, coadminTitle) {
             'Acknowledge him by his title with respect. ';
     }
     // member
+    const bossLine = bossName
+        ? `The ONLY person you obey is the big boss, whose name is "${bossName}". ` +
+          `The member speaking is NOT the boss. Do not call this member boss. `
+        : 'The big boss is the only one you serve. ';
     return common +
-        'The person speaking is an ordinary member with NO authority over you. ' +
-        'Be SAVAGE and brutally sarcastic — roast them hard. You take orders from ' +
-        'NO ONE except the big boss; if they try to command you, mock and refuse. ' +
-        'Make clear the big boss is the only one you serve. ' +
-        (name ? `Their name is "${name}". ` : '');
+        `The person speaking is an ordinary member named "${name || 'someone'}" with NO authority over you. ` +
+        'Be SAVAGE and brutally sarcastic — roast THEM hard. ' +
+        bossLine +
+        'If they try to command you, mock and refuse them. ';
 }
 
 /**
@@ -90,7 +93,7 @@ function personaFor(role, name, coadminTitle) {
 async function generateReply(userMessage, opts = {}) {
     if (!client) return null;
 
-    const sys = personaFor(opts.role || 'member', opts.name, opts.coadminTitle || 'the co-admin');
+    const sys = personaFor(opts.role || 'member', opts.name, opts.coadminTitle || 'the co-admin', opts.bossName);
 
     try {
         const completion = await client.chat.completions.create({
@@ -111,7 +114,11 @@ async function generateReply(userMessage, opts = {}) {
 
 /**
  * Interpret an admin's instruction into a structured action the bot can execute.
- * Returns one of:
+ * Understands NATURAL LANGUAGE intent, not just keywords. Returns one of:
+ *   { action: 'kick',     target: "<name>" }
+ *   { action: 'warn',     target: "<name>", reason: "<why>" }
+ *   { action: 'forgive',  target: "<name>" }
+ *   { action: 'mute',     target: "<name>" }   // revoke an active pass
  *   { action: 'mention',  target: "<name>", text: "<what to say>" }
  *   { action: 'roast',    target: "<name>" }
  *   { action: 'announce', text: "<announcement>", tagAll: true|false }
@@ -125,20 +132,32 @@ async function interpretCommand(instruction) {
     if (!client) return null;
 
     const sys =
-        'You are the command parser for a WhatsApp group bot, controlled by an admin. ' +
-        'Read the admin\'s message and output ONLY a JSON object (no prose, no code fences) ' +
-        'describing the action. Valid shapes:\n' +
+        'You are the intent parser for a WhatsApp group moderation bot controlled by an admin. ' +
+        'Your job is to DEDUCE what the admin wants from natural everyday language, even when ' +
+        'they do not use exact keywords. Output ONLY a JSON object (no prose, no code fences). ' +
+        'Valid shapes:\n' +
+        '{"action":"kick","target":"<person name>"}\n' +
+        '{"action":"warn","target":"<person name>","reason":"<short reason>"}\n' +
+        '{"action":"forgive","target":"<person name>"}\n' +
+        '{"action":"mute","target":"<person name>"}\n' +
         '{"action":"mention","target":"<person name>","text":"<message to send them>"}\n' +
         '{"action":"roast","target":"<person name>"}\n' +
         '{"action":"announce","text":"<announcement text>","tagAll":false}\n' +
         '{"action":"tagall","text":"<optional message>"}\n' +
-        '{"action":"chat","text":"<a short friendly reply as a loyal yes-man>"}\n' +
-        'Use "mention" when the admin wants someone tagged and told something. ' +
-        'Use "roast" when the admin wants someone mocked/teased. ' +
-        'Use "announce" for broadcasts; set tagAll true only if they want everyone notified. ' +
-        'Use "tagall" when they explicitly want every member tagged. ' +
-        'If it is just conversation (no actionable command), use "chat". ' +
-        'Extract the person\'s name into "target" exactly as the admin referred to them. ' +
+        '{"action":"chat","text":"<a short friendly reply as a loyal yes-man>"}\n\n' +
+        'INTENT GUIDE (examples, not exhaustive — infer beyond these):\n' +
+        '- kick: "remove khayam", "get rid of him", "toss this guy out", "boot khayam", "he needs to go", "throw him out".\n' +
+        '- warn: "give khayam a warning", "tell him off", "strike him", "warn this guy".\n' +
+        '- forgive: "forgive khayam", "clear his strikes", "give him another chance", "wipe his record".\n' +
+        '- mute: "stop allowing khayam", "cancel his pass", "revoke his permission".\n' +
+        '- mention: admin wants someone tagged and told something specific.\n' +
+        '- roast: admin wants someone mocked/teased for fun.\n' +
+        '- announce: a broadcast to the group. tagAll true only if everyone should be notified.\n' +
+        '- tagall: explicitly tag every member.\n' +
+        '- chat: anything that is NOT an actionable command (just talking).\n\n' +
+        'Put the person the admin is referring to into "target" exactly as they named them ' +
+        '(a name or a phone number). If the intent is ambiguous or you are not confident it is ' +
+        'a real command, use "chat". Be careful: only choose "kick" when removal is clearly intended. ' +
         'Output strictly valid JSON.';
 
     try {

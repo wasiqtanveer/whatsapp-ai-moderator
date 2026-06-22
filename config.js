@@ -15,6 +15,11 @@ module.exports = {
 
     BOSS_IDS,
     COADMIN_IDS,
+    // The boss's display name (used so the AI calls the RIGHT person boss).
+    BOSS_NAME: process.env.BOSS_NAME || 'the big boss',
+    // The boss's real phone number (digits only, no +). Used to @mention the boss
+    // correctly — do NOT use the @lid here, it renders as a broken number.
+    BOSS_PHONE: (process.env.BOSS_PHONE || '').replace(/\D/g, ''),
     // Display title for the co-admin (Arsalan).
     COADMIN_TITLE: process.env.COADMIN_TITLE || 'Arsalan MPA Saib',
 
